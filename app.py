@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 
 # ================================================================
-# CONFIGURACIÓN BÁSICA DEL CLIENTE
+# CONFIGURACIÓN BÁSICA DEL CLIENTE / CONSTANTES
 # ================================================================
 
 BASE_URL = "https://edgewspmfantasy.onrender.com"
@@ -19,7 +19,7 @@ DEFAULT_SEASON = 2024
 DEFAULT_SEASON_TYPE = 2  # 2 = Regular Season
 DEFAULT_WEEK = 16
 
-# Líneas genéricas (si NO quieres usar ESPN aquí)
+# Líneas genéricas base (si tu API no manda línea específica por jugador)
 DEFAULT_LINES = {
     "passing_yards": 220.5,
     "rushing_yards": 55.5,
@@ -33,14 +33,158 @@ KEY_MARKETS = {
     "WR": {"label": "Receiving Yards", "market_type": "receiving_yards"},
 }
 
-# Tiers por edge (puedes ajustar)
+# Tiers por edge (yardas)
 TIER_PLATINUM_EDGE = 25.0
 TIER_PREMIUM_EDGE = 15.0
 TIER_VALUE_EDGE = 8.0
 
 
 # ================================================================
-# LLAMADAS A LA API
+# ALGORITMOS WSPM – DIRECCIÓN, MARGEN, PROBABILIDAD, CONFIANZA
+# ================================================================
+
+def compute_direction_and_margin(wspm_projection: float, book_line: float) -> Tuple[str, float, float]:
+    """
+    Determina la dirección (OVER/UNDER), el margen en yardas
+    y el margen en % respecto a la línea.
+    """
+    if book_line <= 0:
+        # Evitar divisiones raras: si la línea es 0, asumimos OVER sin margen real
+        return "OVER", 0.0, 0.0
+
+    if wspm_projection >= book_line:
+        direction = "OVER"
+        margin_yards = wspm_projection - book_line
+    else:
+        direction = "UNDER"
+        margin_yards = book_line - wspm_projection
+
+    margin_pct = (margin_yards / book_line) * 100.0
+    return direction, margin_yards, margin_pct
+
+
+def classify_confidence_from_margin(margin_pct: float) -> str:
+    """
+    Clasifica la confianza a partir del margen %.
+    Regla explícita: Confianza Alta sólo si margen > 15%.
+    """
+    if margin_pct > 15.0:
+        return "Alta"
+    elif margin_pct > 10.0:
+        return "Media-Alta"
+    elif margin_pct > 5.0:
+        return "Media"
+    else:
+        return "Baja"
+
+
+def estimate_prob_cover(margin_pct: float) -> float:
+    """
+    Heurística suave para estimar P(cubrir) en función del margen %.
+    Se acota entre 50% y 80% para no inventar cosas locas.
+    """
+    # Base 50%, subimos según margen (escala suave)
+    p = 0.5 + (margin_pct / 100.0) * 0.75
+    if p < 0.5:
+        p = 0.5
+    if p > 0.8:
+        p = 0.8
+    return p
+
+
+def build_wspm_markdown_explanation(
+    matchup: str,
+    team: str,
+    opp: str,
+    player_name: str,
+    position: str,
+    market_type: str,
+    wspm_projection: float,
+    book_line: float,
+    safety_pct_backend: float,
+) -> Tuple[str, str, float, float, str, float]:
+    """
+    Construye el bloque Markdown largo con la narrativa WSPM:
+    - Ponderación de variables
+    - Ajuste neto
+    - Margen
+    - Probabilidad de cubrir
+    - Confianza
+    Devuelve:
+      markdown, direction, margin_yards, effective_margin_pct, confidence_label, prob_cover_pct
+    """
+
+    # 1) Dirección y margen
+    direction, margin_yards, margin_pct = compute_direction_and_margin(
+        wspm_projection, book_line
+    )
+
+    # 2) Tomamos el safety_margin_pct de tu API si viene informado,
+    #    si no, usamos el margen calculado vs línea.
+    effective_margin_pct = (
+        safety_pct_backend
+        if safety_pct_backend and safety_pct_backend > 0
+        else margin_pct
+    )
+
+    # 3) Confianza y probabilidad de cubrir
+    confidence = classify_confidence_from_margin(effective_margin_pct)
+    prob_cover = estimate_prob_cover(effective_margin_pct) * 100.0
+
+    # 4) Ajuste neto (proyección - línea)
+    net_adjust = wspm_projection - book_line
+
+    # Repartimos ese ajuste en "componentes narrativos" (solo narrativa, no afecta al modelo real)
+    if net_adjust == 0:
+        matchup_adj = volume_adj = risk_adj = tempo_adj = 0.0
+    else:
+        matchup_adj = 0.40 * net_adjust
+        volume_adj = 0.35 * net_adjust
+        risk_adj = -0.20 * abs(net_adjust)
+        tempo_adj = net_adjust - (matchup_adj + volume_adj + risk_adj)
+
+    market_label = {
+        "passing_yards": "yardas por pase",
+        "rushing_yards": "yardas por tierra",
+        "receiving_yards": "yardas por recepción",
+    }.get(market_type, market_type.replace("_", " "))
+
+    markdown = f"""### 📈 Proyección del Modelo WSPM
+
+*Partido:* {team} vs {opp} — {matchup}  
+*Jugador:* **{player_name}** – *Posición:* {position}  
+*Línea del book (Proyección O/U):* **{book_line:.1f} {market_label}**  
+*Proyección del modelo WSPM:* **{wspm_projection:.1f} {market_label}**  
+*Pick del modelo WSPM:* **{direction} {book_line:.1f} {market_label}**
+
+#### ⚖️ Ponderación de Variables Clave (vs Línea Base)
+
+* **Variable 1: Matchup Defensivo Avanzado (DVOA/YAC):** impacto del enfrentamiento defensa vs posición.
+  - *Ponderación estimada:* {matchup_adj:+.1f} {market_label}
+* **Variable 2: Volumen de Juego Proyectado (Targets/Carries/Pases):** rol esperado en el gameplan ofensivo.
+  - *Ponderación estimada:* {volume_adj:+.1f} {market_label}
+* **Variable 3: Riesgo / Reversión de Margen:** volatilidad, posibilidad de blowout, cambios de script o lesiones.
+  - *Ponderación estimada:* {risk_adj:+.1f} {market_label}
+* **Variable 4: Game Flow (Ritmo / Tempo del Partido):** total del partido y ritmo ofensivo combinado.
+  - *Ponderación estimada:* {tempo_adj:+.1f} {market_label}
+
+#### 🎯 Análisis y Justificación
+
+*Ajuste Neto Total (suma de ponderaciones):* **{net_adjust:+.1f} {market_label}**  
+*Margen de Seguridad (WSPM):* **{margin_yards:.1f} {market_label}** (~{effective_margin_pct:.1f}% sobre la línea)  
+*Probabilidad Estimada de Cubrir la Línea:* **{prob_cover:.1f}%**
+
+#### 💡 Conclusión
+
+*Dirección Esperada (Valor WSPM):* **{direction} {book_line:.1f} {market_label}**  
+*Confianza del Pick (Rigurosa):* **{confidence}**  
+"""
+
+    return markdown, direction, margin_yards, effective_margin_pct, confidence, prob_cover
+
+
+# ================================================================
+# LLAMADAS A LA API (CACHEADAS)
 # ================================================================
 
 @st.cache_data(ttl=3600)
@@ -78,7 +222,6 @@ def call_player_projection(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         r = requests.post(url, json=payload, timeout=60)
 
         if r.status_code == 422:
-            detail = None
             try:
                 detail = r.json().get("detail", r.text)
             except Exception:
@@ -163,32 +306,25 @@ def build_player_payload(
 def summarize_projection(prediction: Dict[str, Any]) -> Tuple[float, float, float, float, str]:
     """
     Extrae métricas clave del JSON de WSPM.
-    Intenta ser robusto a cambios de nombres.
     Devuelve: (wspm_projection, book_line, edge_yards, safety_margin_pct, tier_label)
     """
-    # Proyección central
     wspm_proj = prediction.get("wspm_projection")
     if wspm_proj is None:
         wspm_proj = prediction.get("model_projection") or prediction.get("projection")
     wspm_proj = float(wspm_proj or 0.0)
 
-    # Línea utilizada
     book_line = prediction.get("book_line")
     if book_line is None:
-        # si no viene explícito, inferimos de edge si existe
         book_line = prediction.get("input_book_line")
     book_line = float(book_line or 0.0)
 
-    # Edge
     edge = prediction.get("edge")
     if edge is None and book_line:
         edge = wspm_proj - book_line
     edge = float(edge or 0.0)
 
-    # Margen de seguridad %
     safety_pct = float(prediction.get("safety_margin_pct") or 0.0)
 
-    # Tier (por edge principalmente)
     if edge >= TIER_PLATINUM_EDGE:
         tier = "Platinum"
     elif edge >= TIER_PREMIUM_EDGE:
@@ -202,7 +338,7 @@ def summarize_projection(prediction: Dict[str, Any]) -> Tuple[float, float, floa
 
 
 def group_roster_key_players(roster: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """Agrupa y elige jugadores clave del roster por posición."""
+    """Agrupa y elige jugadores clave del roster por posición (heurística simple)."""
     grouped = {"QB": [], "RB": [], "WR": []}
     for p in roster.get("players", []):
         pos = (p.get("position") or "").upper()
@@ -210,7 +346,6 @@ def group_roster_key_players(roster: Dict[str, Any]) -> Dict[str, List[Dict[str,
             grouped[pos].append(p)
 
     result: Dict[str, List[Dict[str, Any]]] = {}
-
     # Heurística: 1 QB, 2 RB, 2 WR
     if grouped["QB"]:
         result["QB"] = grouped["QB"][:1]
@@ -246,7 +381,7 @@ def auto_scan_game(
     """
     Escanea un partido:
       - carga roster home / away
-      - elige jugadores clave
+      - elige jugadores clave QB/RB/WR
       - llama WSPM auto-projection-report
     Devuelve lista de picks + lista de errores.
     """
@@ -295,6 +430,14 @@ def auto_scan_game(
                     continue
 
                 wspm_proj, book_line, edge, safety_pct, tier = summarize_projection(proj)
+
+                # Capa IA/heurística: dirección, margen, probabilidad, confianza
+                direction, margin_yards, margin_pct = compute_direction_and_margin(
+                    wspm_proj, book_line
+                )
+                prob_cover = estimate_prob_cover(margin_pct) * 100.0
+                confidence = classify_confidence_from_margin(margin_pct)
+
                 picks.append(
                     {
                         "matchup": game["matchup"],
@@ -313,6 +456,11 @@ def auto_scan_game(
                         "edge": edge,
                         "safety_margin_pct": safety_pct,
                         "tier": tier,
+                        "direction": direction,
+                        "margin_yards": margin_yards,
+                        "margin_pct": margin_pct,
+                        "prob_cover": prob_cover,
+                        "confidence": confidence,
                         "raw_projection": proj,
                     }
                 )
@@ -355,38 +503,43 @@ def build_week_auto_report_text(
         return txt, pd.DataFrame()
 
     df = pd.DataFrame(all_picks)
-    df_sorted = df.sort_values(by=["edge", "safety_margin_pct"], ascending=False).reset_index(drop=True)
+    # Ordenamos por tier (valor), luego por probabilidad y edge
+    df_sorted = df.sort_values(
+        by=["tier", "prob_cover", "edge"], ascending=[True, False, False]
+    ).reset_index(drop=True)
 
-    # FREE PICK = mejor edge
+    # FREE PICK = mejor pick (primero del orden)
     top = df_sorted.iloc[0]
     free_text = (
         f"🎯 Free Pick WSPM – Semana {week} NFL {season}\n\n"
         f"{top['matchup']} | {top['provider']}: {top['details']}, O/U {top['over_under']}\n"
         f"{top['name']} ({top['team']} – {top['market_type'].replace('_', ' ')}) "
-        f"O {top['book_line']:.1f} | Proyección WSPM: {top['wspm_projection']:.1f}, "
-        f"edge {top['edge']:.1f} yds, {tier_emoji(top['tier'])} Tier {top['tier']}\n"
+        f"{top['direction']} {top['book_line']:.1f} | Proyección WSPM: {top['wspm_projection']:.1f}, "
+        f"edge {top['edge']:.1f} yds, {top['margin_pct']:.1f}% margen, "
+        f"Confianza {top['confidence']} (P(cubrir) ~ {top['prob_cover']:.1f}%)\n"
     )
 
-    # PREMIUM / PLATINUM
+    # PREMIUM / PLATINUM – lista completa
     lines_premium: List[str] = []
     for idx, row in df_sorted.iterrows():
         emoji = tier_emoji(row["tier"])
         line = (
             f"{idx+1}. {emoji} {row['name']} ({row['team']} – "
-            f"{row['market_type'].replace('_', ' ')}) O {row['book_line']:.1f} | "
+            f"{row['market_type'].replace('_', ' ')}) {row['direction']} {row['book_line']:.1f} | "
             f"proj {row['wspm_projection']:.1f}, edge {row['edge']:.1f} yds, "
-            f"{row['safety_margin_pct']:.1f}% safety – Tier {row['tier']} "
+            f"{row['margin_pct']:.1f}% margen, P(cubrir)~{row['prob_cover']:.1f}% – "
+            f"Tier {row['tier']} / Conf {row['confidence']} "
             f"[{row['matchup']} | {row['provider']}: {row['details']}, O/U {row['over_under']}]"
         )
         lines_premium.append(line)
 
     premium_block = (
         f"\n💎 Premium / Platinum WSPM – Semana {week} NFL {season}\n"
-        f"Top edges del modelo (ordenados por value esperado):\n\n"
+        f"Top edges del modelo (ordenados por value esperado y probabilidad):\n\n"
         + "\n".join(lines_premium)
     )
 
-    # Breakdown compacto
+    # Breakdown compacto por partido
     breakdown_lines: List[str] = []
     breakdown_lines.append(f"\n📊 Breakdown por partido – Semana {week} NFL {season}\n")
 
@@ -404,8 +557,9 @@ def build_week_auto_report_text(
             emoji = tier_emoji(row["tier"])
             breakdown_lines.append(
                 f"  {emoji} {row['name']} ({row['team']} – {row['market_type'].replace('_', ' ')}) "
-                f"O {row['book_line']:.1f} | proj {row['wspm_projection']:.1f}, "
-                f"edge {row['edge']:.1f} yds, {row['safety_margin_pct']:.1f}% safety, Tier {row['tier']}"
+                f"{row['direction']} {row['book_line']:.1f} | proj {row['wspm_projection']:.1f}, "
+                f"edge {row['edge']:.1f} yds, {row['margin_pct']:.1f}% margen, "
+                f"P(cubrir)~{row['prob_cover']:.1f}%, Tier {row['tier']} ({row['confidence']})"
             )
         breakdown_lines.append("")
 
@@ -430,8 +584,8 @@ def main():
 
     st.title("🏈 WSPM Edge – NFL (Player Props & Auto Picks)")
     st.markdown(
-        "Frontend en Streamlit para orquestar tu API WSPM y generar "
-        "**proyecciones, edges y textos listos para redes sociales**."
+        "Frontend en Streamlit para tu API WSPM: **proyecciones, edges, "
+        "probabilidad de cubrir y textos listos para redes sociales**."
     )
     st.divider()
 
@@ -471,7 +625,7 @@ def main():
     tab1, tab2 = st.tabs(["🎯 Player Prop (manual)", "🤖 Auto Picks Semana (Free/Premium/Platinum)"])
 
     # ============================================================
-    # TAB 1 – Player Prop manual (como tu código original + extra)
+    # TAB 1 – Player Prop manual
     # ============================================================
     with tab1:
         st.header("🎯 Player Prop – Análisis Individual")
@@ -505,10 +659,12 @@ def main():
 
             roster_data = get_team_roster(team_choice)
 
+        players_for_selection: List[Dict[str, Any]] = []
+
         if not roster_data:
             st.warning(f"No se pudo cargar el roster para {team_choice}.")
         else:
-            players_for_selection = []
+            # Armar lista de posibles jugadores (QB/RB/WR)
             for p in roster_data.get("players", []):
                 pos = p.get("position")
                 if pos in ["QB", "RB", "WR"]:
@@ -589,13 +745,29 @@ def main():
                     st.header("📊 Resultado de la Proyección")
 
                     if prediction_report:
-                        st.success(f"Proyección generada para {player_info['name']}")
-
-                        wspm_proj, used_line, edge, safety_pct, tier = summarize_projection(
+                        # Extraemos métricas base del backend (edge, safety_margin_pct, etc.)
+                        wspm_proj, used_line, edge, safety_pct_backend, tier = summarize_projection(
                             prediction_report
                         )
 
-                        col_proj, col_edge, col_safety, col_tier = st.columns(4)
+                        # Construimos explicación WSPM + capa IA (dirección, prob, confianza)
+                        wspm_md, direction, margin_yards, margin_pct, conf_label, prob_cover = (
+                            build_wspm_markdown_explanation(
+                                matchup=matchup_text,
+                                team=team_choice,
+                                opp=opp_choice,
+                                player_name=player_info["name"],
+                                position=player_info["position"],
+                                market_type=selected_market_type,
+                                wspm_projection=wspm_proj,
+                                book_line=used_line,
+                                safety_pct_backend=safety_pct_backend,
+                            )
+                        )
+
+                        # Métricas arriba
+                        col_proj, col_edge, col_safety, col_prob, col_conf = st.columns(5)
+
                         with col_proj:
                             st.metric("Proyección WSPM", f"{wspm_proj:.1f} yds")
                         with col_edge:
@@ -605,31 +777,31 @@ def main():
                                 delta=f"{edge:+.1f}",
                             )
                         with col_safety:
-                            st.metric("Safety Margin", f"{safety_pct:.1f}%")
-                        with col_tier:
-                            st.metric("Tier", tier_emoji(tier) + " " + tier)
+                            st.metric("Margen % (modelo)", f"{margin_pct:.1f}%")
+                        with col_prob:
+                            st.metric("P(cubrir) estimada", f"{prob_cover:.1f}%")
+                        with col_conf:
+                            st.metric("Confianza Pick", conf_label)
 
-                        markdown_report = prediction_report.get("markdown_report")
-                        if markdown_report:
-                            st.markdown(markdown_report)
-                        else:
-                            st.info("La API no devolvió markdown_report; se muestra JSON crudo.")
-                            st.json(prediction_report)
+                        # Bloque largo WSPM
+                        st.markdown(wspm_md)
 
-                        # Texto listo para X / Twitter
-                        st.subheader("📣 Texto para redes (Player Prop)")
-                        txt = (
+                        # Texto corto para redes
+                        st.subheader("📣 Texto corto para redes (Player Prop)")
+                        short_txt = (
                             f"{tier_emoji(tier)} WSPM – {matchup_text}\n"
                             f"{player_info['name']} ({team_choice} – {selected_market_type.replace('_',' ')}) "
-                            f"O {used_line:.1f}\n"
-                            f"Proyección WSPM: {wspm_proj:.1f} yds, edge {edge:.1f}, "
-                            f"Safety {safety_pct:.1f}% – Tier {tier}\n"
+                            f"{direction} {used_line:.1f}\n"
+                            f"Proy: {wspm_proj:.1f} yds | Edge {edge:+.1f} | "
+                            f"Margen {margin_pct:.1f}% | P(cubrir)~{prob_cover:.1f}% | Conf {conf_label}\n"
                             f"#NFL #PlayerProps #WSPM"
                         )
-                        st.code(txt, language="markdown")
+                        st.code(short_txt, language="markdown")
+                    else:
+                        st.error("La API no devolvió una proyección válida.")
 
     # ============================================================
-    # TAB 2 – Auto Picks para la Semana (Free / Premium / Platinum)
+    # TAB 2 – Auto Picks para la Semana
     # ============================================================
     with tab2:
         st.header("🤖 Auto Picks WSPM – Semana Completa")
@@ -661,7 +833,7 @@ def main():
             st.code(report_text, language="markdown")
 
             if not df_picks.empty:
-                st.subheader("📑 Tabla de Picks (ordenados por edge)")
+                st.subheader("📑 Tabla de Picks (ordenados por tier / probabilidad / edge)")
                 st.dataframe(
                     df_picks[
                         [
@@ -670,11 +842,14 @@ def main():
                             "name",
                             "position",
                             "market_type",
+                            "direction",
                             "book_line",
                             "wspm_projection",
                             "edge",
-                            "safety_margin_pct",
+                            "margin_pct",
+                            "prob_cover",
                             "tier",
+                            "confidence",
                         ]
                     ],
                     use_container_width=True,
@@ -682,7 +857,7 @@ def main():
 
                 st.markdown(
                     "_Tip_: filtra en la tabla y copia solo los Platinum/Premium "
-                    "para tu newsletter o canal de Telegram."
+                    "con mayor probabilidad para tu newsletter o canal de Telegram."
                 )
 
 
